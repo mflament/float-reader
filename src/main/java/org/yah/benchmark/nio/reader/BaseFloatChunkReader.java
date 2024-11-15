@@ -11,11 +11,20 @@ import java.nio.file.StandardOpenOption;
 public abstract class BaseFloatChunkReader implements FloatChunkReader {
     protected final Path filePath;
 
-    protected BaseFloatChunkReader(Path filePath) {
+    protected final FileChannel fileChannel;
+
+    protected BaseFloatChunkReader(Path filePath) throws IOException {
         this.filePath = filePath;
+        fileChannel = FileChannel.open(filePath, StandardOpenOption.READ);
     }
 
-    protected final FileChannel openFileChannel() throws IOException {
-        return FileChannel.open(filePath, StandardOpenOption.READ);
+    @Override
+    public final long length() throws IOException {
+        return fileChannel.size() / Float.BYTES;
+    }
+
+    @Override
+    public void close() throws IOException {
+        fileChannel.close();
     }
 }

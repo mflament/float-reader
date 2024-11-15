@@ -28,4 +28,5 @@ public interface FloatChunkReader extends AutoCloseable {
 
     @Override
     void close() throws IOException;
+
 }

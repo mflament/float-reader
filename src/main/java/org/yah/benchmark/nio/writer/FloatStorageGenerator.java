@@ -8,10 +8,12 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.Files;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.HashSet;
 import java.util.LinkedList;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -20,18 +22,20 @@ import java.util.function.IntFunction;
 
 /**
  * Utility class to generate float for testing {@link FloatChunkReader}.
+ * A float storage file is simply an array of float. Number of float can be computed from file size.
  */
 public final class FloatStorageGenerator {
 
     @FunctionalInterface
-    public interface FloatProducer {
+    public interface FloatProducer extends AutoCloseable {
 
         float produce(long index);
 
         /**
          * called after chunk generation, allowing to release/close stuff
          */
-        default void complete() {
+        @SuppressWarnings("RedundantThrows")
+        default void close() throws IOException {
         }
     }
 
@@ -71,16 +75,9 @@ public final class FloatStorageGenerator {
             try {
                 LinkedList<Future<?>> futures = new LinkedList<>();
                 for (int chunkIndex = 0; chunkIndex < threadsCount; chunkIndex++) {
-                    FloatProducer producer = producerFactory.apply(chunkIndex);
                     long currentChunkSize = Math.min(threadChunkSize, count - chunkIndex * threadChunkSize);
                     long chunkStartIndex = startIndex + chunkIndex * threadChunkSize;
-                    Future<?> future = executorService.submit(() -> {
-                        try {
-                            generateChunk(file, producer, chunkStartIndex, currentChunkSize);
-                        } catch (IOException e) {
-                            throw new UncheckedIOException(e);
-                        }
-                    });
+                    Future<?> future = submit(file, producerFactory, executorService, chunkIndex, chunkStartIndex, currentChunkSize);
                     futures.add(future);
                 }
                 waitAndCheck(futures);
@@ -91,54 +88,43 @@ public final class FloatStorageGenerator {
             FloatProducer producer = producerFactory.apply(0);
             generateChunk(file, producer, startIndex, count);
         }
+    }
 
-
-        // write new count (now that all floats are generated)
-        try (FileChannel fileChannel = FileChannel.open(file, StandardOpenOption.WRITE)) { // file should exist and position must be at start
-            ByteBuffer countBuffer = ByteBuffer.allocate(Long.BYTES).order(ByteOrder.nativeOrder());
-            countBuffer.putLong(0, startIndex + count);
-            write(fileChannel, countBuffer);
-        }
+    private static Future<?> submit(Path file, IntFunction<FloatProducer> producerFactory, ExecutorService executorService,
+                                    int chunkIndex, long chunkStartIndex, long currentChunkSize) {
+        return executorService.submit(() -> {
+            try (FloatProducer producer = producerFactory.apply(chunkIndex)) {
+                generateChunk(file, producer, chunkStartIndex, currentChunkSize);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
     }
 
     /**
      * reserve new space for count floats to existing file or create a new file
-     *
-     * @return the start index of file
      */
     private static long allocateFile(Path file, long count, boolean append) throws IOException {
+        Set<OpenOption> options = new HashSet<>();
+        options.add(StandardOpenOption.CREATE);
+        options.add(StandardOpenOption.WRITE);
+        if (append) options.add(StandardOpenOption.APPEND);
         long startIndex;
-        FileChannel fileChannel;
-        if (append && Files.exists(file) && Files.size(file) > Long.BYTES) { // appending to existing file, with at least one float
-            // needs read to get count, do not APPEND, we will use the count to get start position
-            fileChannel = FileChannel.open(file, StandardOpenOption.WRITE, StandardOpenOption.READ);
-            // read count to get start index
-            ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES).order(ByteOrder.nativeOrder());
-            read(buffer, fileChannel);
-            startIndex = buffer.flip().getLong(0);
-        } else { // empty or new file
-            fileChannel = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-            startIndex = 0;
+        try (FileChannel fileChannel = FileChannel.open(file, options)){
+            startIndex = fileChannel.position() / Float.BYTES;
+            // reserve space by writing as single byte at new end position
+            long endPosition = fileChannel.position() + count * Float.BYTES;
+            fileChannel.position(endPosition - 1);
+            write(fileChannel, ByteBuffer.allocate(1));
         }
-
-        long startPosition = computeStartPosition(startIndex);
-        // reserve space by writing as single byte at new end position
-        long endPosition = startPosition + count * Float.BYTES;
-        fileChannel.position(endPosition - 1);
-        write(fileChannel, ByteBuffer.allocate(1));
         return startIndex;
-    }
-
-    // file position to start writing, after count and all existing float
-    private static long computeStartPosition(long startIndex) {
-        return Long.BYTES + startIndex * Float.BYTES;
     }
 
     @SuppressWarnings("PointlessArithmeticExpression") // pointless but explicit :-)
     private static void generateChunk(Path file, FloatProducer producer, long startIndex, long count) throws IOException {
-        // one file channel per thread to avoid concurrent update of position and to allow concurrent write
+        // one file channel per thread to avoid concurrent update of position and allow concurrent write
         // (is this a good idea to write concurrently on a disk ? not sure)
-        long startPosition = computeStartPosition(startIndex);
+        long startPosition = startIndex * Float.BYTES;
         float[] chunkData = new float[1 * MB / Float.BYTES]; // stage 1MB of float on heap before writing
         ByteBuffer stagingBuffer = ByteBuffer.allocate(1 * MB).order(ByteOrder.nativeOrder());
         FloatBuffer floatBuffer = stagingBuffer.asFloatBuffer(); // for bulk write
@@ -177,11 +163,6 @@ public final class FloatStorageGenerator {
                 }
             }
         }
-    }
-
-    // read fully
-    private static void read(ByteBuffer dst, FileChannel src) throws IOException {
-        while (dst.hasRemaining()) src.read(dst);
     }
 
     // write fully

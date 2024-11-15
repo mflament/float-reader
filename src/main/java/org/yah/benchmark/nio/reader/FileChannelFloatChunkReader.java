@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 
 /**
@@ -15,9 +14,15 @@ import java.nio.file.Path;
  */
 public final class FileChannelFloatChunkReader extends BaseFloatChunkReader {
 
-    private final FileChannel fileChannel;
     private final int stagingCapacity;
     private ByteBuffer stagingBuffer;
+
+    /**
+     * @param filePath the storage file path
+     */
+    public FileChannelFloatChunkReader(Path filePath) throws IOException {
+        this(filePath, 1024 * 1024, false);
+    }
 
     /**
      * @param filePath            the storage file path
@@ -26,31 +31,30 @@ public final class FileChannelFloatChunkReader extends BaseFloatChunkReader {
      */
     public FileChannelFloatChunkReader(Path filePath, int stagingCapacity, boolean directStagingBuffer) throws IOException {
         super(filePath);
-        fileChannel = openFileChannel();
         this.stagingCapacity = stagingCapacity;
         stagingBuffer = directStagingBuffer
-                ? ByteBuffer.allocateDirect(stagingCapacity)
-                : ByteBuffer.allocate(stagingCapacity);
+                ? ByteBuffer.allocateDirect(stagingCapacity * Float.BYTES)
+                : ByteBuffer.allocate(stagingCapacity * Float.BYTES);
         stagingBuffer.order(ByteOrder.nativeOrder());
     }
 
     @Override
-    public long length() throws IOException {
-        stagingBuffer.position(0).limit(Long.BYTES);
-        fileChannel.read(stagingBuffer, 0L);
-        return stagingBuffer.getLong(0);
-    }
-
-    @Override
     public void read(float[] dst, long srcIndex, int dstIndex, int length) throws IOException {
-        fileChannel.position(Long.BYTES + srcIndex * Float.BYTES);
-        int remaining = Math.min(length, dst.length - dstIndex), index = dstIndex;
+        fileChannel.position(srcIndex * Float.BYTES);
+        // cap length: , and file capacity from src position
+        int remaining = length;
+        if (remaining > dst.length - dstIndex)
+            remaining = dst.length - dstIndex; // no more than dst capacity from dstIndex
+        long srcCapacity = (fileChannel.size() - fileChannel.position()) / Float.BYTES;
+        if (remaining > srcCapacity)
+            remaining = (int) srcCapacity; // no more than file length from srcIndex
         stagingBuffer.clear();
         FloatBuffer floatBuffer = stagingBuffer.asFloatBuffer();
         while (remaining > 0) {
             int chunkSize = Math.min(stagingCapacity, remaining);
             stagingBuffer.position(0).limit(chunkSize * Float.BYTES);
-            while (stagingBuffer.hasRemaining()) fileChannel.read(stagingBuffer);
+            while (stagingBuffer.hasRemaining())
+                fileChannel.read(stagingBuffer);
             floatBuffer.get(0, dst, dstIndex, chunkSize);
             dstIndex += chunkSize;
             remaining -= chunkSize;
@@ -61,6 +65,6 @@ public final class FileChannelFloatChunkReader extends BaseFloatChunkReader {
     public void close() throws IOException {
         // release staging buffers
         stagingBuffer = null;
-        fileChannel.close();
+        super.close();
     }
 }
